@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Tremor Monitor</title>
+<style>
+:root{--bg:#f3f5f4;--card:#fff;--ink:#17201d;--mute:#5d6b66;--line:#d5dcd9;--raw:#2a6f97;--filt:#c1440e;--band:rgba(193,68,14,.14);--ok:#1b7f4b;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#101615;--card:#18201e;--ink:#e6eeea;--mute:#8fa19a;--line:#2b3733;--raw:#6cb4dd;--filt:#ff8a50;--band:rgba(255,138,80,.16);--ok:#5fd394;color-scheme:dark}}
+*{box-sizing:border-box}
+html{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:14px;max-width:760px;margin-inline:auto}
+h1{font-size:22px;margin:4px 0 2px}
+p.sub{margin:0 0 12px;color:var(--mute)}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+button,select,input{font:inherit;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:9px 12px}
+button.main{background:var(--ink);color:var(--bg);border-color:var(--ink);font-weight:600}
+button:disabled{opacity:.45}
+input{width:76px}
+.status{color:var(--mute);font-size:13px}
+.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.stat b{display:block;font-size:24px;font-variant-numeric:tabular-nums}
+.stat span{color:var(--mute);font-size:13px}
+.plot{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:12px}
+.plot h2{font-size:15px;margin:0 0 2px}
+.plot small{display:block;color:var(--mute);margin-bottom:6px}
+canvas{width:100%;height:150px;display:block}
+.note{color:var(--mute);font-size:12.5px;margin-top:6px}
+#err{color:#c0392b;margin-bottom:10px;display:none}
+</style>
+</head>
+<body>
+<h1>Tremor monitor</h1>
+<p class="sub">Bluetooth IMU → discrete signal, filter and spectrum.</p>
+
+<div id="err"></div>
+<div class="bar">
+  <button class="main" id="connect">Connect</button>
+  <button id="disconnect" disabled>Disconnect</button>
+  <button id="csv" disabled>Save CSV</button>
+</div>
+<div class="bar">
+  <label>Signal
+    <select id="src">
+      <option value="amag">Accel magnitude</option>
+      <option value="ax">Accel X</option>
+      <option value="ay">Accel Y</option>
+      <option value="az">Accel Z</option>
+      <option value="gmag">Gyro magnitude</option>
+      <option value="gx">Gyro X</option>
+      <option value="gy">Gyro Y</option>
+      <option value="gz">Gyro Z</option>
+    </select>
+  </label>
+  <label>Sample rate (Hz) <input id="fs" type="number" value="100" min="20" max="1000"></label>
+</div>
+<div class="status" id="status">Not connected.</div>
+
+<div class="stats" style="margin-top:12px">
+  <div class="stat"><b id="sFreq">–</b><span>Dominant frequency (Hz)</span></div>
+  <div class="stat"><b id="sRms">–</b><span>Tremor RMS (3–8 Hz band)</span></div>
+  <div class="stat"><b id="sPow">–</b><span>Power in 4–6 Hz (% of 1–15 Hz)</span></div>
+  <div class="stat"><b id="sRate">–</b><span>Measured rate (samples/s)</span></div>
+</div>
+
+<div class="plot"><h2>Buzzer alerts</h2><small>Thresholds are tremor RMS in g. Levels 1, 2 and 3 raise the buzzer pitch and beep rate.</small>
+  <div class="bar">
+    <label>Level 1 <input id="t1" type="number" step="0.005" min="0" value="0.02"></label>
+    <label>Level 2 <input id="t2" type="number" step="0.005" min="0" value="0.05"></label>
+    <label>Level 3 <input id="t3" type="number" step="0.005" min="0" value="0.10"></label>
+    <label><input id="buz" type="checkbox" checked style="width:auto"> Buzzer on</label>
+    <button id="recal" type="button">Recalibrate</button>
+  </div>
+  <div class="stat"><b id="lvl">–</b><span id="lvlSub">Device level (from the ESP32)</span></div>
+</div>
+<div class="plot"><h2>Raw signal, discrete samples</h2><small id="rawLbl">Each dot is one sample. Last 3 s.</small><canvas id="cRaw"></canvas></div>
+<div class="plot"><h2>Band-pass filtered, 3–8 Hz</h2><small>High-pass 3 Hz then low-pass 8 Hz (biquad IIR).</small><canvas id="cFilt"></canvas></div>
+<div class="plot"><h2>Frequency spectrum (FFT)</h2><small>Shaded band = 4–6 Hz, typical Parkinsonian rest tremor.</small><canvas id="cFft"></canvas></div>
+<p class="note">Needs Chrome on Android or desktop, opened over HTTPS. This is a signal-processing project tool, not a medical device or diagnosis.</p>
+
+<script>
+const SVC='6e400001-b5a3-f393-e0a9-e50e24dcca9e', CHR='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+const $=id=>document.getElementById(id);
+const STAT='6e400004-b5a3-f393-e0a9-e50e24dcca9e', CFG='6e400005-b5a3-f393-e0a9-e50e24dcca9e';
+let cfgChr=null;
+async function sendCfg(){
+  if(!cfgChr)return;
+  const b=new DataView(new ArrayBuffer(7));
+  ['t1','t2','t3'].forEach((id,i)=>b.setUint16(i*2,Math.max(0,Math.round((+$(id).value||0)*10000)),true));
+  b.setUint8(6,$('buz').checked?1:0);
+  try{await cfgChr.writeValueWithoutResponse(b.buffer)}catch(e){err('Could not send settings: '+e.message)}
+}
+['t1','t2','t3','buz'].forEach(id=>$(id).addEventListener('change',sendCfg));
+$('recal').onclick=async()=>{
+  if(!cfgChr){err('Connect first.');return}
+  try{await cfgChr.writeValueWithoutResponse(new Uint8Array([1]))}catch(e){err('Could not start calibration: '+e.message)}
+};
+const N=512; // FFT window
+let dev=null, chr=null, fs=100, raw=[], filt=[], rows=[], count=0, lastCount=0, lastT=performance.now(), hp, lp;
+
+class Biquad{
+  constructor(type,f0,fs,Q=0.7071){
+    const w=2*Math.PI*f0/fs, c=Math.cos(w), a=Math.sin(w)/(2*Q), a0=1+a;
+    if(type==='hp'){this.b=[(1+c)/2/a0,-(1+c)/a0,(1+c)/2/a0]}else{this.b=[(1-c)/2/a0,(1-c)/a0,(1-c)/2/a0]}
+    this.a=[-2*c/a0,(1-a)/a0]; this.x1=this.x2=this.y1=this.y2=0;
+  }
+  p(x){const y=this.b[0]*x+this.b[1]*this.x1+this.b[2]*this.x2-this.a[0]*this.y1-this.a[1]*this.y2;
+    this.x2=this.x1;this.x1=x;this.y2=this.y1;this.y1=y;return y}
+}
+function resetDSP(){fs=Math.max(20,+$('fs').value||100);hp=new Biquad('hp',3,fs);lp=new Biquad('lp',Math.min(8,fs/2.5),fs);raw=[];filt=[]}
+$('src').onchange=resetDSP; $('fs').onchange=resetDSP; resetDSP();
+
+function pick(s){
+  switch($('src').value){
+    case 'amag':return Math.hypot(s.ax,s.ay,s.az);
+    case 'gmag':return Math.hypot(s.gx,s.gy,s.gz);
+    default:return s[$('src').value];
+  }
+}
+function onData(dv){
+  for(let o=0;o+12<=dv.byteLength;o+=12){
+    const s={ax:dv.getInt16(o,true)/1000,ay:dv.getInt16(o+2,true)/1000,az:dv.getInt16(o+4,true)/1000,
+             gx:dv.getInt16(o+6,true)/10,gy:dv.getInt16(o+8,true)/10,gz:dv.getInt16(o+10,true)/10};
+    const v=pick(s); raw.push(v); filt.push(lp.p(hp.p(v)));
+    if(raw.length>N){raw.shift();filt.shift()}
+    if(rows.length<200000)rows.push([count,s.ax,s.ay,s.az,s.gx,s.gy,s.gz]);
+    count++;
+  }
+}
+
+function fft(re,im){
+  const n=re.length;
+  for(let i=1,j=0;i<n;i++){let b=n>>1;for(;j&b;b>>=1)j^=b;j^=b;if(i<j){[re[i],re[j]]=[re[j],re[i]];[im[i],im[j]]=[im[j],im[i]]}}
+  for(let len=2;len<=n;len<<=1){
+    const ang=-2*Math.PI/len,wr=Math.cos(ang),wi=Math.sin(ang);
+    for(let i=0;i<n;i+=len){let cr=1,ci=0;
+      for(let k=0;k<len/2;k++){
+        const a=i+k,b=a+len/2,tr=re[b]*cr-im[b]*ci,ti=re[b]*ci+im[b]*cr;
+        re[b]=re[a]-tr;im[b]=im[a]-ti;re[a]+=tr;im[a]+=ti;
+        const t=cr*wr-ci*wi;ci=cr*wi+ci*wr;cr=t;
+      }}
+  }
+}
+function spectrum(){
+  const re=new Float64Array(N),im=new Float64Array(N),m=raw.reduce((a,b)=>a+b,0)/raw.length;
+  for(let i=0;i<raw.length;i++)re[i]=(raw[i]-m)*(0.5-0.5*Math.cos(2*Math.PI*i/(raw.length-1)));
+  fft(re,im);
+  const mag=[];for(let k=0;k<N/2;k++)mag.push(Math.hypot(re[k],im[k])/N);
+  return mag;
+}
+
+function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()}
+function setup(c){const r=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;if(c.width!==w*r){c.width=w*r;c.height=h*r}
+  const g=c.getContext('2d');g.setTransform(r,0,0,r,0,0);g.clearRect(0,0,w,h);return[g,w,h]}
+function axes(g,w,h,ymin,ymax,xlab){
+  g.strokeStyle=css('--line');g.fillStyle=css('--mute');g.font='11px system-ui';g.lineWidth=1;
+  g.strokeRect(34.5,4.5,w-40,h-24);
+  g.fillText(ymax.toPrecision(3),0,12);g.fillText(ymin.toPrecision(3),0,h-18);
+  if(xlab)g.fillText(xlab,34,h-4);
+}
+function drawTime(c,data,color,dots){
+  const[g,w,h]=setup(c),len=Math.min(data.length,Math.round(fs*3)),d=data.slice(-len);
+  if(d.length<2){axes(g,w,h,0,1,'');return}
+  let mn=Math.min(...d),mx=Math.max(...d);if(mx-mn<1e-6){mx+=.5;mn-=.5}
+  const pad=(mx-mn)*.08;mn-=pad;mx+=pad;axes(g,w,h,mn,mx,'0 s … 3 s');
+  const X=i=>34+(i/(Math.round(fs*3)-1))*(w-40)+(w-40)*(Math.round(fs*3)-len)/Math.round(fs*3)*0,Y=v=>4+(1-(v-mn)/(mx-mn))*(h-24);
+  g.strokeStyle=color;g.fillStyle=color;g.lineWidth=1.5;g.beginPath();
+  d.forEach((v,i)=>{const x=X(i),y=Y(v);i?g.lineTo(x,y):g.moveTo(x,y)});g.stroke();
+  if(dots)d.forEach((v,i)=>{g.beginPath();g.arc(X(i),Y(v),2.2,0,7);g.fill()});
+}
+function drawFft(c,mag){
+  const[g,w,h]=setup(c),fmax=15,bins=Math.floor(fmax*N/fs);
+  if(!mag){axes(g,w,h,0,1,'');return null}
+  const d=mag.slice(0,bins+1);let mx=Math.max(...d,1e-9);
+  axes(g,w,h,0,mx,'0 Hz … 15 Hz');
+  const X=k=>34+(k*fs/N/fmax)*(w-40),Y=v=>4+(1-v/mx)*(h-24);
+  g.fillStyle=css('--band');g.fillRect(X(4*N/fs),4,X(6*N/fs)-X(4*N/fs),h-24);
+  g.strokeStyle=css('--raw');g.lineWidth=1.5;g.beginPath();
+  d.forEach((v,k)=>{k?g.lineTo(X(k),Y(v)):g.moveTo(X(k),Y(v))});g.stroke();
+  let pk=Math.ceil(1*N/fs);for(let k=pk;k<=bins;k++)if(d[k]>d[pk])pk=k;
+  g.fillStyle=css('--filt');g.beginPath();g.arc(X(pk),Y(d[pk]),4,0,7);g.fill();
+  g.fillText((pk*fs/N).toFixed(1)+' Hz',Math.min(X(pk)+6,w-52),Y(d[pk])+4);
+  return pk;
+}
+function tick(){
+  const now=performance.now();
+  if(now-lastT>=1000){$('sRate').textContent=Math.round((count-lastCount)*1000/(now-lastT));lastCount=count;lastT=now}
+  $('rawLbl').textContent='Each dot is one sample at '+fs+' Hz (every '+(1000/fs).toFixed(0)+' ms). Last 3 s.';
+  drawTime($('cRaw'),raw,css('--raw'),true);
+  drawTime($('cFilt'),filt,css('--filt'),false);
+  if(raw.length>=N){
+    const mag=spectrum(),pk=drawFft($('cFft'),mag);
+    $('sFreq').textContent=(pk*fs/N).toFixed(1);
+    const f=filt.slice(-Math.round(fs*2));$('sRms').textContent=Math.sqrt(f.reduce((a,b)=>a+b*b,0)/f.length).toPrecision(3);
+    let tot=0,band=0;for(let k=0;k<N/2;k++){const hz=k*fs/N,p=mag[k]*mag[k];if(hz>=1&&hz<=15)tot+=p;if(hz>=4&&hz<=6)band+=p}
+    $('sPow').textContent=tot>0?Math.round(100*band/tot)+'%':'–';
+  }else{drawFft($('cFft'),null);$('status').textContent=dev?('Connected: '+dev.name+'. Collecting '+raw.length+'/'+N+' samples for the spectrum…'):$('status').textContent}
+  if(raw.length>=N&&dev)$('status').textContent='Connected: '+dev.name;
+}
+setInterval(tick,100);
+
+function err(m){const e=$('err');e.textContent=m;e.style.display=m?'block':'none'}
+$('connect').onclick=async()=>{
+  err('');
+  if(!navigator.bluetooth){err('Web Bluetooth is not available. Use Chrome on Android or desktop, over HTTPS.');return}
+  try{
+    dev=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
+    dev.addEventListener('gattserverdisconnected',()=>{cfgChr=null;$('lvl').textContent='–';$('status').textContent='Disconnected.';$('connect').disabled=false;$('disconnect').disabled=true;dev=null});
+    $('status').textContent='Connecting…';
+    const srv=await dev.gatt.connect(),svc=await srv.getPrimaryService(SVC);
+    chr=await svc.getCharacteristic(CHR);
+    resetDSP();rows=[];count=0;lastCount=0;
+    chr.addEventListener('characteristicvaluechanged',e=>onData(e.target.value));
+    await chr.startNotifications();
+    cfgChr=await svc.getCharacteristic(CFG);
+    const st=await svc.getCharacteristic(STAT);
+    st.addEventListener('characteristicvaluechanged',e=>{
+      const d=e.target.value,rms=d.getUint16(0,true)/10000,lv=d.getUint8(2),cal=d.getUint8(3)&1;
+      if(!cal)['t1','t2','t3'].forEach((id,i)=>{if(document.activeElement!==$(id))$(id).value=(d.getUint16(4+i*2,true)/10000).toFixed(4)});
+      $('lvl').textContent=cal?'Calibrating…':'Level '+lv;
+      $('lvlSub').textContent=cal?'Keep moving your hand normally for 10 s':'Device tremor RMS '+rms.toFixed(3)+' g';
+    });
+    await st.startNotifications();
+    $('connect').disabled=true;$('disconnect').disabled=false;$('csv').disabled=false;
+  }catch(e){dev=null;$('status').textContent='Not connected.';err(e.name==='NotFoundError'?'No device selected.':'Connection failed: '+e.message)}
+};
+$('disconnect').onclick=()=>{if(dev&&dev.gatt.connected)dev.gatt.disconnect()};
+$('csv').onclick=()=>{
+  const t='sample,t_s,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps\n'+rows.map(r=>[r[0],(r[0]/fs).toFixed(4),...r.slice(1)].join(',')).join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/csv'}));a.download='tremor-data.csv';a.click();
+};
+</script>
+</body>
+</html>
